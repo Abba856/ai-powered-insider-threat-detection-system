@@ -21,6 +21,7 @@ X_scaled = scaler.fit_transform(X)
 iso = IsolationForest(contamination=0.1, random_state=42)
 iso.fit(X_scaled)
 iso_scores = -iso.score_samples(X_scaled)
+joblib.dump(scaler, os.path.join(MODEL_DIR, 'scaler.pkl'))
 joblib.dump(iso, os.path.join(MODEL_DIR, 'isolation_forest.pkl'))
 
 # One-Class SVM

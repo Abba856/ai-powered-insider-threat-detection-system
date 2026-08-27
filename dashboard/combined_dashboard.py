@@ -1,10 +1,14 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import networkx as nx
 from pyvis.network import Network
+import joblib
 import os
 
 DATA_DIR = 'data'
+MODEL_DIR = 'models'
+FEATURE_COLS = ['mean_login_hour', 'mean_logout_hour', 'files_per_day', 'usb_per_day', 'emails_per_day', 'out_of_session_access', 'degree_centrality', 'betweenness_centrality', 'keyword_flag', 'subject_len', 'sentiment']
 
 st.set_page_config(layout="wide")
 st.title('AI-Powered Insider Threat Detection: Combined Dashboard')
@@ -18,7 +22,69 @@ def load_all_data():
     return features, scores, file_access, usb_usage
 
 features, scores, file_access, usb_usage = load_all_data()
+
+# Keep datasets in session state so new records can be appended and re-scored
+if 'features' not in st.session_state:
+    st.session_state['features'] = features
+if 'scores' not in st.session_state:
+    st.session_state['scores'] = scores
+if 'custom_users' not in st.session_state:
+    st.session_state['custom_users'] = pd.DataFrame()
+
+features = st.session_state['features']
+scores = st.session_state['scores']
 df = pd.merge(features, scores, on='user')
+
+# Score new custom records using trained models + scaler
+def score_custom_users():
+    if st.session_state['custom_users'].empty:
+        return
+    scaler = joblib.load(os.path.join(MODEL_DIR, 'scaler.pkl'))
+    iso = joblib.load(os.path.join(MODEL_DIR, 'isolation_forest.pkl'))
+    svm = joblib.load(os.path.join(MODEL_DIR, 'oneclass_svm.pkl'))
+    auto = joblib.load(os.path.join(MODEL_DIR, 'autoencoder.pkl'))
+
+    all_features = pd.concat([
+        st.session_state['features'][FEATURE_COLS],
+        st.session_state['custom_users'][FEATURE_COLS]
+    ], ignore_index=True)
+    X_scaled = scaler.transform(all_features)
+
+    iso_scores = -iso.score_samples(X_scaled)
+    svm_scores = -svm.decision_function(X_scaled)
+    auto_scores = np.mean((X_scaled - auto.predict(X_scaled))**2, axis=1)
+
+    n_orig = len(st.session_state['features'])
+    iso_s = iso_scores[n_orig:]
+    svm_s = svm_scores[n_orig:]
+    auto_s = auto_scores[n_orig:]
+    custom_anom = np.maximum.reduce([iso_s, svm_s, auto_s])
+    is_rt = (custom_anom >= RED_TEAM_BASELINE).astype(int)
+    st.session_state['custom_users'] = st.session_state['custom_users'].assign(is_red_team=is_rt)
+    new_scores = pd.DataFrame({
+        'user': st.session_state['custom_users']['user'].values,
+        'is_red_team': is_rt,
+        'isolation_forest': iso_s,
+        'oneclass_svm': svm_s,
+        'autoencoder': auto_s
+    })
+    st.session_state['scores'] = pd.concat([st.session_state['scores'], new_scores], ignore_index=True)
+    st.session_state['features'] = pd.concat([st.session_state['features'], st.session_state['custom_users']], ignore_index=True)
+
+def reset_custom():
+    st.session_state['features'] = features_orig
+    st.session_state['scores'] = scores_orig
+    st.session_state['custom_users'] = pd.DataFrame()
+
+features_orig, scores_orig, _, _ = load_all_data()
+
+# Auto-flag baseline: a custom user is marked red team if its anomaly score
+# is at least as high as the least anomalous known red-team user.
+def red_team_baseline():
+    rt = scores_orig[scores_orig['is_red_team'] == 1]
+    anom = rt[['isolation_forest', 'oneclass_svm', 'autoencoder']].max(axis=1)
+    return float(anom.min())
+RED_TEAM_BASELINE = red_team_baseline()
 
 # Prepare node attributes for graph
 def get_node_attrs():
@@ -35,14 +101,30 @@ def get_node_attrs():
 attrs = get_node_attrs()
 
 # Build full graph
-def build_graph():
+def build_graph(custom_df=pd.DataFrame()):
     G = nx.Graph()
     for _, row in file_access.iterrows():
         G.add_edge(row['user'], row['file'], type='access')
     for _, row in usb_usage.iterrows():
         G.add_edge(row['user'], row['device'], type='usb')
+    # Connect custom users to the SAME real files/devices real users access,
+    # so they join the main connected component instead of isolated islands.
+    if not custom_df.empty:
+        real_files = np.asarray(file_access['file'].unique())
+        real_devices = np.asarray(usb_usage['device'].unique())
+        rng = np.random.default_rng(42)
+        for _, row in custom_df.iterrows():
+            user = row['user']
+            n_f = int(round(row.get('files_per_day', 0)))
+            n_u = int(round(row.get('usb_per_day', 0)))
+            if len(real_files):
+                for f in rng.choice(real_files, size=min(n_f, len(real_files)), replace=False):
+                    G.add_edge(user, f, type='access')
+            if len(real_devices):
+                for d in rng.choice(real_devices, size=min(n_u, len(real_devices)), replace=False):
+                    G.add_edge(user, d, type='usb')
     return G
-G = build_graph()
+G = build_graph(st.session_state.get('custom_users', pd.DataFrame()))
 
 # At-risk subgraph
 def get_at_risk_subgraph(G, attrs):
@@ -54,7 +136,7 @@ def get_at_risk_subgraph(G, attrs):
     return G.subgraph(connected_nodes).copy()
 
 # Tabs
-anomaly_tab, user_tab, graph_tab, how_tab = st.tabs(["Anomaly Table", "User Detail", "At-Risk Graph", "How Does It Work?"])
+anomaly_tab, user_tab, graph_tab, data_tab, how_tab = st.tabs(["Anomaly Table", "User Detail", "At-Risk Graph", "Data Input", "How Does It Work?"])
 
 with anomaly_tab:
     st.header('User Anomaly Scores')
@@ -123,6 +205,65 @@ with graph_tab:
         net.add_edge(edge[0], edge[1], color='gray' if edge[2]['type']=='access' else 'purple')
     net.save_graph('dashboard/graph.html')
     st.components.v1.html(open('dashboard/graph.html', 'r', encoding='utf-8').read(), height=900, scrolling=False)
+
+with data_tab:
+    st.header('Input Records & Re-Score')
+    st.markdown('Enter up to 5 user records with behavioral features. Click **Submit & Score** to append them to the dataset and re-run the anomaly detection models. New records appear in the Anomaly Table, Top 5 chart, and At-Risk Graph.')
+
+    feature_labels = {
+        'mean_login_hour': ('Mean Login Hour (0-24)', 8.0, 0.0, 24.0),
+        'mean_logout_hour': ('Mean Logout Hour (0-24)', 16.0, 0.0, 24.0),
+        'files_per_day': ('Files Accessed / Day', 3.5, 0.0, 100.0),
+        'usb_per_day': ('USB Plugs / Day', 1.0, 0.0, 50.0),
+        'emails_per_day': ('Emails Sent / Day', 2.5, 0.0, 50.0),
+        'out_of_session_access': ('Out-of-Session Access Count', 70, 0, 500),
+        'degree_centrality': ('Degree Centrality (0-1)', 0.65, 0.0, 1.0),
+        'betweenness_centrality': ('Betweenness Centrality (0-1)', 0.03, 0.0, 1.0),
+        'keyword_flag': ('Email Keyword Flag Rate (0-1)', 0.4, 0.0, 1.0),
+        'subject_len': ('Avg Email Subject Length', 9.5, 0.0, 100.0),
+        'sentiment': ('Email Sentiment', 0.0, -1.0, 1.0),
+    }
+
+    with st.form('record_form'):
+        cols = st.columns(5)
+        records = []
+        for i in range(5):
+            with cols[i]:
+                st.subheader(f'Record {i+1}')
+                user_name = st.text_input('User Name', value=f'custom_user{i+1}', key=f'name_{i}')
+                rec = {'user': user_name}
+                for feat, (label, default, lo, hi) in feature_labels.items():
+                    step = 0.01 if isinstance(default, float) and hi <= 1.0 else (0.1 if isinstance(default, float) else 1)
+                    rec[feat] = st.number_input(label, value=default, min_value=lo, max_value=hi, step=step, key=f'{feat}_{i}')
+                records.append(rec)
+        submitted = st.form_submit_button('Submit & Score')
+
+    if submitted:
+        new_df = pd.DataFrame(records)
+        # Drop records whose user name is empty
+        new_df = new_df[new_df['user'].str.strip() != '']
+        if new_df.empty:
+            st.warning('Please enter at least one record with a user name.')
+        else:
+            dup = new_df['user'].isin(st.session_state['features']['user'].values)
+            if dup.any():
+                st.warning('One or more user names already exist in the dataset. Custom users skipped.')
+                new_df = new_df[~dup]
+            if not new_df.empty:
+                st.session_state['custom_users'] = new_df.reset_index(drop=True)
+                score_custom_users()
+                st.success(f'Added {len(new_df)} record(s). Re-scored with all models. See the other tabs.')
+                st.rerun()
+
+    if not st.session_state['custom_users'].empty:
+        st.subheader('Custom Records Added')
+        disp = st.session_state['custom_users'].copy()
+        merged = pd.merge(disp, st.session_state['scores'], on='user', how='left')
+        st.dataframe(merged[['user', 'isolation_forest', 'oneclass_svm', 'autoencoder']], height=200)
+        if st.button('Reset to Original Dataset'):
+            reset_custom()
+            st.success('Reverted to original dataset.')
+            st.rerun()
 
 with how_tab:
     st.header('How Does It Work?')
